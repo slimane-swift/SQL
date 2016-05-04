@@ -335,98 +335,239 @@ public extension Model {
         return selectFields.map { Self.field($0) }
     }
     
-    public static func get<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ pk: Self.PrimaryKey, connection: T) throws -> Self? {
-        return try selectQuery.filter(declaredPrimaryKeyField == pk).first(connection)
+    public static func get<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ pk: Self.PrimaryKey, connection: T, completion: (Void throws -> Self?) -> Void) {
+        selectQuery.filter(declaredPrimaryKeyField == pk).first(connection) { f in
+            completion {
+                try f()
+            }
+        }
     }
     
-    mutating func create<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws {
+    mutating func create<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> Self) -> Void) {
         guard !isPersisted else {
-            throw ModelError(description: "Cannot create an already persisted model.")
+            completion {
+                throw ModelError(description: "Cannot create an already persisted model.")
+            }
+            return
         }
         
-        let pk: PrimaryKey = try connection.executeInsertQuery(query: self.dynamicType.insertQuery(values: persistedValuesByField), returningPrimaryKeyForField: self.dynamicType.declaredPrimaryKeyField)
-        
-        guard let newSelf = try self.dynamicType.get(pk, connection: connection) else {
-            throw ModelError(description: "Failed to find model of supposedly inserted id \(pk)")
+        let query = self.dynamicType.insertQuery(values: persistedValuesByField)
+        let returningPrimaryKeyForField = self.dynamicType.declaredPrimaryKeyField
+        connection.executeInsertQuery(query: query, returningPrimaryKeyForField: returningPrimaryKeyForField) { (f: Void throws -> PrimaryKey) in
+            do {
+                let pk = try f()
+                
+                self.dynamicType.get(pk, connection: connection) {
+                    do {
+                        guard let newSelf = try $0() else {
+                            return completion {
+                                throw ModelError(description: "Failed to find model of supposedly inserted id \(pk)")
+                            }
+                        }
+                        
+                        self = newSelf
+                        completion {
+                            self.willSave()
+                            self.willCreate()
+                            self = newSelf
+                            self.didCreate()
+                            self.didSave()
+                            return self
+                        }
+                    } catch {
+                        completion {
+                            throw error
+                        }
+                    }
+                }
+            } catch {
+                completion {
+                    throw error
+                }
+            }
         }
-        
-        willSave()
-        willCreate()
-        self = newSelf
-        didCreate()
-        didSave()
     }
     
-    public mutating func refresh<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws {
-        guard let pk = primaryKey, newSelf = try Self.get(pk, connection: connection) else {
-            throw ModelError(description: "Cannot refresh a non-persisted model. Please use insert() or save() first.")
-        }
+    public mutating func refresh<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> Self) -> Void) {
         
-        willRefresh()
-        self = newSelf
-        didRefresh()
-    }
-    
-    public mutating func update<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws {
         guard let pk = primaryKey else {
-            throw ModelError(description: "Cannot update a model that isn't persisted. Please use insert() first or save()")
+            return completion {
+                throw ModelError(description: "Cannot refresh a non-persisted model. Please use insert() or save() first.")
+            }
+        }
+        
+        Self.get(pk, connection: connection) {
+            do {
+                guard let newSelf = try $0() else {
+                    throw ModelError(description: "Cannot refresh a non-persisted model. Please use insert() or save() first.")
+                }
+                
+                self.willRefresh()
+                self = newSelf
+                self.didRefresh()
+                
+                completion {
+                    self
+                }
+            } catch {
+                completion {
+                    throw error
+                }
+            }
+        }
+    }
+    
+    public mutating func update<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> Self) -> Void) {
+        guard let pk = primaryKey else {
+            return completion {
+                throw ModelError(description: "Cannot update a model that isn't persisted. Please use insert() first or save()")
+            }
         }
         
         let values = changedValuesByField ?? persistedValuesByField
         
         guard !values.isEmpty else {
-            throw ModelError(description: "Nothing to save")
+            return completion {
+                throw ModelError(description: "Nothing to save")
+            }
         }
         
-        try validate()
         
-        willSave()
-        willUpdate()
-        try Self.updateQuery(values).filter(Self.declaredPrimaryKeyField == pk).execute(connection)
-        didUpdate()
-        try self.refresh(connection)
-        didSave()
+        var tasks: [AsyncSeriesCallback] = []
+        
+        tasks.append({ next in
+            self.validate { f in
+                next {
+                    try f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            self.willSave { f in
+                next {
+                    f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            self.willUpdate() { f in
+                next {
+                    f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            Self.updateQuery(values).filter(Self.declaredPrimaryKeyField == pk).execute(connection) { f in
+                next {
+                    try f()
+                }
+            }
+        })
+        
+        var newSelf: Self?
+        
+        tasks.append({ next in
+            self.refresh(connection) { f in
+                next {
+                    newSelf = try f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            self.didSave() { f in
+                next {
+                    f()
+                }
+            }
+        })
+        
+        Async.series(tasksFor: tasks) { f in
+            completion {
+                try f()
+                return newSelf!
+            }
+        }
     }
     
-    public mutating func delete<T: ConnectionProtocol>(_ connection: T) throws {
+    public mutating func delete<T: AsyncConnectionProtocol>(_ connection: T, completion: (Void throws -> Void) -> Void) throws {
         guard let pk = self.primaryKey else {
-            throw ModelError(description: "Cannot delete a model that isn't persisted.")
+            return completion {
+                throw ModelError(description: "Cannot delete a model that isn't persisted.")
+            }
         }
         
-        willDelete()
-        try Self.deleteQuery.filter(Self.declaredPrimaryKeyField == pk).execute(connection)
-        didDelete()
+        
+        var tasks: [AsyncSeriesCallback] = []
+        
+        tasks.append({ next in
+            self.willDelete { f in
+                next {
+                    f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            Self.deleteQuery.filter(Self.declaredPrimaryKeyField == pk).execute(connection) { f in
+                next {
+                    try f()
+                }
+            }
+        })
+        
+        tasks.append({ next in
+            self.didDelete { f in
+                next {
+                    f()
+                }
+            }
+        })
+        
+        Async.series(tasksFor: tasks, completion: completion)
     }
 
-    public mutating func save<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws {
+    public mutating func save<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> Self) -> Void) throws {
         
         if isPersisted {
-            try update(connection)
+            update(connection) { f in
+                completion {
+                    try f()
+                }
+            }
         }
         else {
-            try create(connection)
-            guard isPersisted else {
-                fatalError("Primary key not set after insert. This is a serious error in an SQL adapter. Please consult a developer.")
+            create(connection) { f in
+                completion {
+                    let model = try f()
+                    guard model.isPersisted else {
+                        fatalError("Primary key not set after insert. This is a serious error in an SQL adapter. Please consult a developer.")
+                    }
+                    return model
+                }
             }
         }
     }
 }
 
 public extension Model {
-    public func willSave() {}
-    public func didSave() {}
+    public func willSave(_ completion: (Void -> Void) -> Void) {}
+    public func didSave(_ completion: (Void -> Void) -> Void) {}
     
-    public func willUpdate() {}
-    public func didUpdate() {}
+    public func willUpdate(_ completion: (Void -> Void) -> Void) {}
+    public func didUpdate(_ completion: (Void -> Void) -> Void) {}
     
-    public func willCreate() {}
-    public func didCreate() {}
+    public func willCreate(_ completion: (Void -> Void) -> Void) {}
+    public func didCreate(_ completion: (Void -> Void) -> Void) {}
     
-    public func willDelete() {}
-    public func didDelete() {}
+    public func willDelete(_ completion: (Void -> Void) -> Void) {}
+    public func didDelete(_ completion: (Void -> Void) -> Void) {}
     
-    public func willRefresh() {}
-    public func didRefresh() {}
+    public func willRefresh(_ completion: (Void -> Void) -> Void) {}
+    public func didRefresh(_ completion: (Void -> Void) -> Void) {}
     
-    public func validate() throws {}
+    public func validate(_ completion: (Void throws -> Void) -> Void) {}
 }

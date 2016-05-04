@@ -49,7 +49,7 @@ public extension ConnectionInfoProtocol {
     }
 }
 
-public protocol ConnectionProtocol: class {
+public protocol AsyncConnectionProtocol: class {
     associatedtype InternalStatus
     associatedtype Result: ResultProtocol
     associatedtype Error: ErrorProtocol
@@ -59,19 +59,19 @@ public protocol ConnectionProtocol: class {
     
     var connectionInfo: ConnectionInfo { get }
 
-    func open() throws
+    func open(_ completion: (Void throws -> Void) -> Void)
 
     func close()
 
     var internalStatus: InternalStatus { get }
 
-    func execute(_ statement: QueryComponents) throws -> Result
+    func execute(_ statement: QueryComponents, completion: (Void throws -> Result) -> Void)
 
-    func begin() throws
+    func begin(_ completion: (Void throws -> Void) -> Void)
 
-    func commit() throws
+    func commit(_ completion: (Void throws -> Void) -> Void)
 
-    func rollback() throws
+    func rollback(_ completion: (Void throws -> Void) -> Void)
 
     func createSavePointNamed(_ name: String) throws
 
@@ -83,25 +83,33 @@ public protocol ConnectionProtocol: class {
     
     var mostRecentError: Error? { get }
     
-    func executeInsertQuery<T: SQLDataConvertible>(query: InsertQuery, returningPrimaryKeyForField primaryKey: DeclaredField) throws -> T
+    func executeInsertQuery<T: SQLDataConvertible>(query: InsertQuery, returningPrimaryKeyForField primaryKey: DeclaredField, completion: (Void throws -> T) -> Void)
 }
 
-public extension ConnectionProtocol {
+public extension AsyncConnectionProtocol {
     
     public init(_ uri: URI) throws {
         try self.init(ConnectionInfo(uri))
     }
 
-    public func transaction(block: Void throws -> Void) throws {
-        try begin()
+    public func transaction(block: (Void throws -> Void) -> Void, completion: (Void throws -> Void) -> Void) {
+        begin {
+            do {
+                try $0()
+                block {
+                    self.commit {
+                        do {
+                            try $0()
+                            completion {}
+                        } catch {
+                            self.rollback(completion)
+                        }
+                    }
+                }
+            } catch {
+                self.rollback(completion)
+            }
 
-        do {
-            try block()
-            try commit()
-        }
-        catch {
-            try rollback()
-            throw error
         }
     }
 
@@ -119,31 +127,55 @@ public extension ConnectionProtocol {
         }
     }
     
-    public func execute(_ statement: QueryComponents) throws -> Result {
-        return try execute(statement)
+//    public func execute(_ statement: QueryComponents) throws -> Result {¥
+//        return try execute(statement)
+//    }
+    
+    public func execute(_ statement: String, parameters: [SQLDataConvertible?] = [], completion: (Void throws -> Result) -> Void) {
+        execute(QueryComponents(statement, values: parameters.map { $0?.sqlData })) { f in
+            completion {
+                try f()
+            }
+        }
     }
     
-    public func execute(_ statement: String, parameters: [SQLDataConvertible?] = []) throws -> Result {
-        return try execute(QueryComponents(statement, values: parameters.map { $0?.sqlData }))
-    }
-    
-    public func execute(_ statement: String, parameters: SQLDataConvertible?...) throws -> Result {
-        return try execute(statement, parameters: parameters)
+//    public func execute(_ statement: String, parameters: SQLDataConvertible?..., completion: (Void throws -> Result) -> Void)  {
+//        execute(statement, parameters: parameters) { f in
+//            completion {
+//                try f()
+//            }
+//        }
+//    }
+
+    public func execute(_ convertible: QueryComponentsConvertible, completion: (Void throws -> Result) -> Void) {
+        execute(convertible.queryComponents) { f in
+            completion {
+                try f()
+            }
+        }
     }
 
-    public func execute(_ convertible: QueryComponentsConvertible) throws -> Result {
-        return try execute(convertible.queryComponents)
+    public func begin(_ completion: (Void throws -> Void) -> Void) {
+        execute("BEGIN") { f in
+            completion {
+                try f()
+            }
+        }
     }
 
-    public func begin() throws {
-        try execute("BEGIN")
+    public func commit(_ completion: (Void throws -> Void) -> Void) {
+        execute("COMMIT") { f in
+            completion {
+                try f()
+            }
+        }
     }
 
-    public func commit() throws {
-        try execute("COMMIT")
-    }
-
-    public func rollback() throws {
-        try execute("ROLLBACK")
+    public func rollback(_ completion: (Void throws -> Void) -> Void) {
+        execute("ROLLBACK") { f in
+            completion {
+                try f()
+            }
+        }
     }
 }

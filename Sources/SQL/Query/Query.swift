@@ -26,8 +26,12 @@
 public protocol Query: QueryComponentsConvertible {}
 
 public extension Query {
-    public func execute<T: ConnectionProtocol>(_ connection: T) throws -> T.Result {
-        return try connection.execute(self)
+    public func execute<T: AsyncConnectionProtocol>(_ connection: T, completion: (Void throws -> T.Result) -> Void) {
+        connection.execute(self) { f in
+            completion {
+                try f()
+            }
+        }
     }
 }
 
@@ -40,15 +44,24 @@ public protocol ModelQuery: TableQuery {
 }
 
 public extension ModelQuery where Self: FetchQuery {
-    public func fetch<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws -> [ModelType] {
-        return try connection.execute(self).map { try ModelType(row: $0) }
+    public func fetch<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> [ModelType]) -> Void) {
+        connection.execute(self) { f in
+            completion {
+                try f().map { try ModelType(row: $0) }
+            }
+        }
     }
     
-    public func first<T: ConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T) throws -> ModelType? {
+    public func first<T: AsyncConnectionProtocol where T.Result.Iterator.Element == Row>(_ connection: T, completion: (Void throws -> ModelType?) -> Void) {
         var new = self
         new.offset = 0
         new.limit = 1
-        return try connection.execute(new).map { try ModelType(row: $0) }.first
+
+        connection.execute(new) { f in
+            completion {
+                try f().map { try ModelType(row: $0) }.first
+            }
+        }
     }
     
     public func orderBy(_ values: [ModelOrderBy<ModelType>]) -> Self {
